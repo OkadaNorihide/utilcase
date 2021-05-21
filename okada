@@ -1,0 +1,122 @@
+CREATE TEMPORARY FUNCTION startDate() as (DATE('2021-02-20'));-- 集計開始日（N）
+CREATE TEMPORARY FUNCTION endDate() as (DATE('2021-05-19'));-- 集計断面
+with 
+# 閲覧
+item_view as (
+    select
+        seq_user_id,
+        item_id,
+        count(*) as view_times,
+        min(date_time) as first_view_time,
+        max(date_time) as last_view_time,
+        max(clid) as clid,
+    from `acl-dmp-arise.arise_process.item_view_log_from_hit_data_20210201_20210520`
+    WHERE
+        DATE(date_time) >= startDate()
+        AND DATE(date_time) <= endDate()
+    group by seq_user_id, item_id 
+),
+# お気に入り 
+favo as (
+    select 
+        seq_user_id,
+        seq_exhibit_id as item_id,
+        min(reg_date) as reg_date,
+        min(clid) as clid,
+        1 as favo_flg
+    from `acl-dmp-prd.raw_exadata.user_watch_list` as favo
+        left join (SELECT lot_no, clid FROM `acl-dmp-prd.raw_wowmanager.product` 
+    WHERE DATE(_PARTITIONTIME) = endDate()) as product 
+        on favo.seq_exhibit_id = product.lot_no
+    WHERE DATE(_PARTITIONTIME) = endDate() 
+        and DATE(reg_date) >= startDate()
+        and seq_user_id is not null
+        and seq_exhibit_id is not null
+    group by seq_user_id, item_id
+),
+# カゴ入れ
+card as (
+    SELECT  
+        cart_item.seq_cart_id, -- 購買ログと結合用ID
+        cart_item.seq_exhibit_id as item_id,  -- item_id
+        cart_item.reg_date as cart_item_reg_date, -- 登録日
+        shopping_cart.seq_user_id,  -- user_id
+        shopping_cart.exhibiter_id as shop_id, -- shop_id
+        shopping_cart.cart_st,  -- カートの状態
+        # (1) as cart_flg
+    FROM `acl-dmp-prd.raw_exadata.cart_item` as cart_item
+-- shopping_cartを結合
+inner join (SELECT 
+                seq_cart_id,
+                seq_user_id,
+                exhibiter_id,
+                cart_st,
+                reg_date as cart_reg_date,
+                last_accessed_date as cart_last_accessed_date
+            FROM `acl-dmp-prd.raw_exadata.shopping_cart` 
+            WHERE DATE(_PARTITIONTIME) = endDate()
+            AND  DATE(reg_date) between startDate() and endDate()
+            and seq_user_id is not null) as shopping_cart
+on cart_item.seq_cart_id = shopping_cart.seq_cart_id
+WHERE DATE(cart_item._PARTITIONTIME) = endDate()
+),
+# 購買ログ
+purchase as (
+    select 
+        user_id,
+        item_id,
+        COUNT(DISTINCT purchase_order_id) as purchase_times, # 期間内購入回数
+        (1) as purchase_flg # 期間内購入有無
+    from `acl-dmp-prd.prep_profiles.wowma_purchase_details` 
+    where 
+        DATE(_PARTITIONTIME) = endDate()
+    and DATE(purchase_date) >= startDate()
+    and DATE(purchase_date) <= endDate()
+    GROUP BY 
+        user_id,
+        item_id
+),
+joined_tbl as (
+SELECT
+    item_view.seq_user_id,
+    item_view.item_id,
+    item_view.clid,
+    item_view.view_times,
+    favo.reg_date as favo_reg_date,
+    case when favo.favo_flg = 1 then 1 else 0 end as favo_flg,
+    case when cart_info.cart_flg = 1 then 1 else 0 end as cart_flg,
+    case when purchase.purchase_flg = 1 then 1 else 0 end as purchase_flg,
+    case when purchase.purchase_times = 1 then 1 else 0 end as purchase_times,
+FROM item_view
+LEFT JOIN favo
+    ON item_view.seq_user_id = favo.seq_user_id
+    AND item_view.item_id = favo.item_id
+LEFT JOIN (
+    SELECT 
+        item_id,  -- item_id
+        seq_user_id,  -- user_id
+        (1) as cart_flg
+    FROM card
+    GROUP BY item_id, seq_user_id
+) as cart_info
+    ON cart_info.item_id = item_view.item_id
+    AND cart_info.seq_user_id = item_view.seq_user_id
+LEFT JOIN purchase 
+    ON item_view.seq_user_id = purchase.user_id
+    AND item_view.item_id = purchase.item_id
+)
+SELECT 
+    clid, # 店舗ID
+    COUNT(seq_user_id) as total_lead_num, # リード数
+    COUNT(DISTINCT seq_user_id) as total_uu_num, # UU数
+    countif(favo_flg = 1 and purchase_flg = 1) as pattern1,                     -- お気に入り購買
+    countif(favo_flg = 1 and cart_flg = 1 and purchase_flg != 1) as pattern2,   -- お気に入りかご購買なし, シナリオ１
+    countif(favo_flg = 1 and cart_flg != 1) as pattern3,                        -- お気に入りかごなし, シナリオ２
+    countif(favo_flg = 0 and purchase_flg = 1) as pattern4,                     -- お気に入りなし購買
+    countif(favo_flg = 0 and cart_flg = 1 and purchase_flg != 1) as pattern5,   -- お気に入りなしかご購買なし, シナリオ３
+    countif(favo_flg = 0 and cart_flg != 1) as pattern6,                        -- お気に入りなしかごなし, シナリオ４
+    # countif(favo_flg= 1) as favo_num,
+    # count(*) as total_lead_num,
+    # countif(purchase_flg = 1) as purchase_num,
+FROM joined_tbl 
+GROUP BY clid
